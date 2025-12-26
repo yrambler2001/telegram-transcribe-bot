@@ -1,0 +1,14 @@
+{
+  "name": "telegram-transcribe-bot",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./index.js",
+    "deploy": "pm2 start ./ecosystem.config.js && pm2 save",
+    "restart": "pm2 reload ./ecosystem.config.js"
+  },
+  "dependencies": {
+    "@google-cloud/speech": "7.2.1",
+    "@google-cloud/storage": "7.18.0",
+    "node-telegram-bot-api": "0.67.0"
+  }
+}
