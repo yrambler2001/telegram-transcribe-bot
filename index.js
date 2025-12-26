@@ -1,14 +1,17 @@
 import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs';
 import path from 'path';
-import https from 'https';
-import ffmpeg from 'fluent-ffmpeg'; // Ensure this is installed
+import ffmpeg from 'fluent-ffmpeg';
 import { processFile } from './transcribe.js';
 import { TELEGRAM_BOT_TOKEN, VOICE_MESSAGES_DIR, ALLOWED_TELEGRAM_USERS } from './config.js';
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+// --- CONFIGURATION FOR LOCAL SERVER ---
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
+  polling: true,
+  // Point to your local VPS server
+  baseApiUrl: 'http://localhost:8081',
+});
 
-// Ensure download directory exists
 if (!fs.existsSync(VOICE_MESSAGES_DIR)) {
   fs.mkdirSync(VOICE_MESSAGES_DIR, { recursive: true });
 }
@@ -25,37 +28,12 @@ function isUserAllowed(msg) {
   return false;
 }
 
-// --- HELPER: DOWNLOAD FILE ---
-function downloadFile(url, filePath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filePath);
-    https
-      .get(url, (response) => {
-        if (response.statusCode !== 200) {
-          return reject(new Error(`Failed to download: Status Code ${response.statusCode}`));
-        }
-        response.pipe(file);
-        file.on('finish', () => {
-          file.close();
-          resolve(filePath);
-        });
-        file.on('error', (err) => {
-          cleanupFiles(filePath); // Cleanup on error
-          reject(err);
-        });
-      })
-      .on('error', (err) => {
-        cleanupFiles(filePath); // Cleanup on error
-        reject(err);
-      });
-  });
-}
-
 // --- HELPER: EXTRACT AUDIO WITH FFMPEG ---
 function extractAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .toFormat('mp3')
+      .audioBitrate('320k')
       .on('end', () => resolve(outputPath))
       .on('error', (err) => reject(err))
       .save(outputPath);
@@ -85,8 +63,8 @@ async function handleMediaMessage(msg, type) {
   const messageId = msg.message_id;
   const language = userPreferences[chatId] || 'uk'; // Default to Ukrainian
 
-  let originalFilePath = null;
   let convertedAudioPath = null;
+  let localFilePath = null;
   let processingMsg = null;
 
   try {
@@ -103,21 +81,27 @@ async function handleMediaMessage(msg, type) {
 
     if (!fileId) throw new Error('Could not find file ID in message.');
 
-    // 2. Get Download Link & Determine Extension
-    const fileLink = await bot.getFileLink(fileId);
-    // Telegram usually gives file paths like '.../file_0.mp4' or '.../voice.oga'
-    // We try to grab the extension from the link, default to .tmp if missing
-    const ext = path.extname(fileLink) || '.tmp';
+    // 2. Get File Info (returns the absolute path on the VPS)
+    // We do NOT use getFileLink() because that tries to make a URL.
+    // We want the raw path from the local server.
+    const fileInfo = await bot.getFile(fileId);
 
-    originalFilePath = path.join(VOICE_MESSAGES_DIR, `${type}_${chatId}_${Date.now()}_raw${ext}`);
+    // fileInfo.file_path will be something like: /var/lib/telegram-bot-api/<token>/videos/file_0.mp4
+    localFilePath = fileInfo.file_path;
+
+    if (!localFilePath) {
+      throw new Error('Local server did not return a file path.');
+    }
+
+    // Debug log to confirm we are reading from disk
+    console.log(`Reading directly from disk: ${localFilePath}`);
+
+    // 3. Prepare Output Path for the temporary MP3
+    // We still need to convert it to MP3 for the transcriber
     convertedAudioPath = path.join(VOICE_MESSAGES_DIR, `${type}_${chatId}_${Date.now()}_audio.mp3`);
 
-    // 3. Download
-    await downloadFile(fileLink, originalFilePath);
-
-    // 4. Convert to MP3 (Extract Audio)
-    // We convert everything to MP3 to standardize input for the transcriber
-    await extractAudio(originalFilePath, convertedAudioPath);
+    // 4. Convert directly (Input is the file on disk)
+    await extractAudio(localFilePath, convertedAudioPath);
 
     // 5. Transcribe
     const { formattedTranscript } = await processFile(convertedAudioPath, language);
@@ -136,7 +120,10 @@ async function handleMediaMessage(msg, type) {
   } finally {
     // 7. CLEANUP: IMPORTANT
     // This runs regardless of success or failure
-    cleanupFiles(originalFilePath, convertedAudioPath);
+    cleanupFiles(convertedAudioPath);
+    // 8. Delete the original video from the Telegram Cache
+    // We only need it for the few seconds that ffmpeg is reading it.
+    cleanupFiles(localFilePath);
   }
 }
 
