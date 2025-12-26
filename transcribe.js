@@ -25,6 +25,8 @@ function formatTime(secondsString) {
 const langMap = {
   uk: 'uk-UA',
   en: 'en-US',
+  pl: 'pl-PL',
+  ru: 'ru-RU',
 };
 export async function processFile(filename, lang = 'uk') {
   console.log(`transcribing ${filename} ${lang}`);
@@ -35,7 +37,7 @@ export async function processFile(filename, lang = 'uk') {
   const gcsOutputUri = `gs://${BUCKET_NAME}/${GCS_TRANSCRIPTS_PREFIX}`;
 
   try {
-    console.log(`⬆️  Uploading: ${filename}...`);
+    console.log(`⬆️ Uploading: ${filename}...`);
     await storageClient.bucket(BUCKET_NAME).upload(localPath, {
       destination: `${GCS_AUDIO_FILES_PREFIX}${name}`,
     });
