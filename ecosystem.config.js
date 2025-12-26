@@ -11,5 +11,6 @@ export const apps = [
     error_file: './logs/error.log',
     out_file: './logs/output.log',
     merge_logs: true,
+    node_args: '--no-network-family-autoselection',
   },
-]
+];
