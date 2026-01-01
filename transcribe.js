@@ -13,7 +13,6 @@ const storageClient = new Storage({ keyFilename: GOOGLE_KEY_PATH });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Format "HH:MM:SS" to seconds
 function parseSeconds(timeString) {
   if (!timeString) return 0;
   if (timeString.includes(':')) {
@@ -41,7 +40,6 @@ export function getDuration(filePath) {
   });
 }
 
-// Updated Splitter: Handles both fixed time AND custom timecodes
 function splitAudio(filePath, splitConfig) {
   return new Promise((resolve, reject) => {
     const { dir, name, ext } = path.parse(filePath);
@@ -51,14 +49,11 @@ function splitAudio(filePath, splitConfig) {
 
     const command = ffmpeg(filePath).outputOptions([`-f segment`, `-c:a libmp3lame`, `-b:a 320k`, `-reset_timestamps 1`]);
 
-    // Handle Custom vs Automatic
     if (Array.isArray(splitConfig)) {
-      // Custom Timecodes (e.g., "00:10:00,00:25:30")
       const timecodeStr = splitConfig.join(',');
       console.log(`   Mode: Custom Split Points -> ${timecodeStr}`);
       command.outputOptions([`-segment_times ${timecodeStr}`]);
     } else {
-      // Fixed Duration (e.g., 1140 seconds)
       console.log(`   Mode: Auto Split Every ${splitConfig}s`);
       command.outputOptions([`-segment_time ${splitConfig}`]);
     }
@@ -83,12 +78,6 @@ function splitAudio(filePath, splitConfig) {
 // --- TRANSCRIPTION LOGIC ---
 
 async function transcribePart(filename, lang, timeOffset = 0) {
-  // ... (SAME AS BEFORE) ...
-  // [Copy the entire transcribePart function from the previous response here]
-  // The logic inside transcribePart has not changed,
-  // only how we call it (the timeOffset value) changes in processFile below.
-
-  // -- RE-INSERTING THE FUNCTION FOR COMPLETENESS --
   const projectId = await speechClient.getProjectId();
   const { name, base } = path.parse(filename);
   const gcsAudioUri = `gs://${BUCKET_NAME}/${GCS_AUDIO_FILES_PREFIX}${base}`;
@@ -141,8 +130,12 @@ async function transcribePart(filename, lang, timeOffset = 0) {
       storageClient.bucket(BUCKET_NAME).file(outputFileName).delete(),
     ]);
 
-    // PARSING with Heuristic
+    // --- SMART PARSING LOGIC (UPDATED) ---
     const allWords = jsonResponse.results.flatMap((r) => r.alternatives[0].words || []);
+
+    // 1. Check if Google provided ANY punctuation
+    const hasPunctuation = allWords.some((w) => /[.!?]/.test(w.word));
+
     let formattedTranscript = '';
     let currentLine = '';
     let currentLineStartTime = null;
@@ -156,10 +149,21 @@ async function transcribePart(filename, lang, timeOffset = 0) {
       const endSeconds = parseSeconds(end);
       const gap = startSeconds - lastWordEndTime;
 
-      const isSignificantPause = index > 0 && gap > 1.0;
-      if (currentLine === '') currentLineStartTime = startSeconds; // Use Number for start
+      if (currentLine === '') currentLineStartTime = startSeconds;
 
-      if (isSignificantPause && currentLine.length > 0) {
+      // 2. Decide whether to force a split based on silence
+      let shouldSplitBySilence = false;
+
+      if (index > 0) {
+        if (hasPunctuation) {
+          // If punctuation exists, only split on HUGE gaps (e.g., 5 seconds silence = new paragraph)
+          if (gap > 5.0) shouldSplitBySilence = true;
+        } else {
+          if (gap > 1.0) shouldSplitBySilence = true;
+        }
+      }
+
+      if (shouldSplitBySilence && currentLine.length > 0) {
         formattedTranscript += `${formatTime(currentLineStartTime, timeOffset)} ${currentLine.trim()}\n`;
         currentLine = '';
         currentLineStartTime = startSeconds;
@@ -169,7 +173,11 @@ async function transcribePart(filename, lang, timeOffset = 0) {
 
       const isSentenceEnd = /[.!?]$/.test(word);
       const isComma = /[,]$/.test(word);
-      if (isSentenceEnd || (currentLine.length > 100 && isComma) || currentLine.length > 150 || index === allWords.length - 1) {
+
+      // Safety break for very long lines without punctuation
+      const isTooLong = currentLine.length > 150;
+
+      if (isSentenceEnd || (isComma && currentLine.length > 100) || isTooLong || index === allWords.length - 1) {
         formattedTranscript += `${formatTime(currentLineStartTime, timeOffset)} ${currentLine.trim()}\n`;
         currentLine = '';
         currentLineStartTime = null;
@@ -187,38 +195,25 @@ async function transcribePart(filename, lang, timeOffset = 0) {
 const langMap = { uk: 'uk-UA', en: 'en-US', pl: 'pl-PL', ru: 'ru-RU' };
 
 // --- MAIN PROCESS FUNCTION ---
-// Now accepts customSplitPoints (Array of Strings) OR null
 export async function processFile(filename, lang = 'uk', customSplitPoints = null) {
   console.log(`🚀 Starting job: ${filename} [${lang}]`);
 
-  // 1. Files Prep
   let filesToProcess = [];
-  let chunkOffsets = []; // Store start time (in seconds) for each chunk
+  let chunkOffsets = [];
   let isSplit = false;
 
   if (customSplitPoints) {
-    // --- MANUAL SPLIT MODE ---
     filesToProcess = await splitAudio(filename, customSplitPoints);
     isSplit = true;
-
-    // Calculate offsets for Manual Splits
-    // e.g., ["00:10:00", "00:25:00"]
-    // Part 0 starts at 0
-    // Part 1 starts at 600s
-    // Part 2 starts at 1500s
     chunkOffsets.push(0);
     customSplitPoints.forEach((tc) => chunkOffsets.push(parseSeconds(tc)));
   } else {
-    // --- AUTOMATIC SPLIT MODE ---
-    // Note: index.js logic implies we only reach here if duration < 19m
-    // But kept for safety/backward compatibility
     const duration = await getDuration(filename);
     const SPLIT_THRESHOLD = 1140;
 
     if (duration > SPLIT_THRESHOLD) {
       filesToProcess = await splitAudio(filename, SPLIT_THRESHOLD);
       isSplit = true;
-      // Calculate offsets for Auto Splits (0, 1140, 2280...)
       for (let i = 0; i < filesToProcess.length; i++) {
         chunkOffsets.push(i * SPLIT_THRESHOLD);
       }
@@ -228,7 +223,6 @@ export async function processFile(filename, lang = 'uk', customSplitPoints = nul
     }
   }
 
-  // 2. Processing Loop
   const BATCH_SIZE = 4;
   let fullTranscript = '';
 
@@ -238,10 +232,7 @@ export async function processFile(filename, lang = 'uk', customSplitPoints = nul
     const batchPromises = batch.map(async (file, index) => {
       await sleep(index * 2000);
       const globalIndex = i + index;
-
-      // Use the specific calculated offset for this chunk
       const timeOffset = chunkOffsets[globalIndex];
-
       return transcribePart(file, lang, timeOffset);
     });
 
