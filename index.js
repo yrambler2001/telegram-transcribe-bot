@@ -104,7 +104,7 @@ async function sendLongMessage(chatId, text, replyToMessageId) {
   for (let i = 0; i < chunks.length; i++) {
     await bot.sendMessage(chatId, chunks[i], {
       parse_mode: 'Markdown',
-      reply_to_message_id: i === 0 ? replyToMessageId : undefined,
+      reply_to_message_id: replyToMessageId,
     });
   }
 }
