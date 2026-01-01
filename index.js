@@ -54,6 +54,49 @@ function cleanupFiles(...paths) {
   });
 }
 
+// --- HELPER: SEND LONG MESSAGES ---
+// Telegram limit is 4096 chars. We split at ~4000 to be safe.
+async function sendLongMessage(chatId, text, replyToMessageId) {
+  const MAX_LENGTH = 4000;
+  
+  if (text.length <= MAX_LENGTH) {
+    return bot.sendMessage(chatId, text, {
+      parse_mode: 'Markdown',
+      reply_to_message_id: replyToMessageId,
+    });
+  }
+
+  const chunks = [];
+  let currentText = text;
+
+  while (currentText.length > 0) {
+    if (currentText.length <= MAX_LENGTH) {
+      chunks.push(currentText);
+      break;
+    }
+
+    // Find the nearest newline or space before MAX_LENGTH to avoid cutting words
+    let splitIndex = currentText.lastIndexOf('\n', MAX_LENGTH);
+    if (splitIndex === -1) splitIndex = currentText.lastIndexOf(' ', MAX_LENGTH);
+    
+    // If no convenient split point found (one huge word?), hard cut it
+    if (splitIndex === -1) splitIndex = MAX_LENGTH;
+
+    chunks.push(currentText.substring(0, splitIndex));
+    currentText = currentText.substring(splitIndex).trim(); // Remove leading space/newline
+  }
+
+  // Send chunks sequentially
+  for (let i = 0; i < chunks.length; i++) {
+    await bot.sendMessage(chatId, chunks[i], {
+      parse_mode: 'Markdown', 
+      // Only reply to the user's message with the FIRST chunk.
+      // Subsequent chunks are just sent normally to avoid spamming "replies".
+      reply_to_message_id: i === 0 ? replyToMessageId : undefined, 
+    });
+  }
+}
+
 // --- GENERIC MEDIA HANDLER ---
 // Handles Voice, Video, and Video Notes (Circles)
 async function handleMediaMessage(msg, type) {
@@ -105,12 +148,10 @@ async function handleMediaMessage(msg, type) {
 
     // 5. Transcribe
     const { formattedTranscript } = await processFile(convertedAudioPath, language);
+    const finalText = formattedTranscript || '⚠️ Transcription returned empty.';
 
-    // 6. Send Result
-    await bot.sendMessage(chatId, formattedTranscript || '⚠️ Transcription returned empty.', {
-      parse_mode: 'Markdown',
-      reply_to_message_id: messageId,
-    });
+    // 6. Send Result (Using SAFE splitter)
+    await sendLongMessage(chatId, finalText, messageId);
 
     // Remove "Processing..." status
     bot.deleteMessage(chatId, processingMsg.message_id).catch(() => {});
