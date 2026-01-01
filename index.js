@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs';
 import path from 'path';
 import ffmpeg from 'fluent-ffmpeg';
-import { processFile } from './transcribe.js';
+import { processFile, getDuration } from './transcribe.js'; // Added getDuration import
 import { TELEGRAM_BOT_TOKEN, VOICE_MESSAGES_DIR, ALLOWED_TELEGRAM_USERS } from './config.js';
 
 // --- CONFIGURATION ---
@@ -16,37 +16,36 @@ if (!fs.existsSync(VOICE_MESSAGES_DIR)) {
 }
 
 // CONSTANTS
-const REQUEST_TIMEOUT_MS = 15 * 60 * 1000; // 15 Minutes
-const CLEANUP_INTERVAL_MS = 60 * 1000; // Check every 1 minute
+const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 60 * 1000;
+const MAX_SEGMENT_DURATION_SEC = 19 * 60; // 19 Minutes
 
-// Store pending files: Key = chatId, Value = { fileId, type, originalMessageId, promptMessageId, timestamp }
-const pendingRequests = new Map();
+// STATE MANAGEMENT
+const pendingRequests = new Map(); // Setup phase (choosing language)
+const waitingForTimecodes = new Map(); // Manual split phase (chatId -> { filePath, lang, originalMessageId, duration })
 
-// --- AUTOMATIC EXPIRATION CLEANUP ---
+// --- CLEANUP INTERVAL ---
 setInterval(() => {
   const now = Date.now();
-
+  // Cleanup pending setup requests
   for (const [chatId, request] of pendingRequests.entries()) {
     if (now - request.timestamp > REQUEST_TIMEOUT_MS) {
-      // 1. Remove from memory
       pendingRequests.delete(chatId);
-
-      // 2. Notify user by editing the button message
-      bot
-        .editMessageText('❌ Request expired (15m timeout). Please resend.', {
-          chat_id: chatId,
-          message_id: request.promptMessageId,
-        })
-        .catch((err) => {
-          // Ignore errors (e.g., if user deleted the chat)
-        });
-
-      console.log(`Expired pending request for Chat ID: ${chatId}`);
+      bot.editMessageText('❌ Request expired.', { chat_id: chatId, message_id: request.promptMessageId }).catch(() => {});
+    }
+  }
+  // Cleanup waiting timecode requests
+  for (const [chatId, data] of waitingForTimecodes.entries()) {
+    if (now - data.timestamp > REQUEST_TIMEOUT_MS) {
+      waitingForTimecodes.delete(chatId);
+      cleanupFiles(data.filePath);
+      bot.sendMessage(chatId, '❌ Timecode entry timed out. File deleted.');
     }
   }
 }, CLEANUP_INTERVAL_MS);
 
-// --- SECURITY CHECK ---
+// --- HELPERS ---
+
 function isUserAllowed(msg) {
   const userId = msg.from.id;
   if (ALLOWED_TELEGRAM_USERS.includes(userId)) return true;
@@ -54,7 +53,6 @@ function isUserAllowed(msg) {
   return false;
 }
 
-// --- HELPER: FFMPEG EXTRACTION ---
 function extractAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
@@ -66,7 +64,6 @@ function extractAudio(inputPath, outputPath) {
   });
 }
 
-// --- HELPER: CLEANUP ---
 function cleanupFiles(...paths) {
   paths.forEach((filePath) => {
     if (filePath && fs.existsSync(filePath)) {
@@ -79,7 +76,6 @@ function cleanupFiles(...paths) {
   });
 }
 
-// --- HELPER: SEND LONG MESSAGES ---
 async function sendLongMessage(chatId, text, replyToMessageId) {
   const MAX_LENGTH = 4000;
   if (text.length <= MAX_LENGTH) {
@@ -109,12 +105,83 @@ async function sendLongMessage(chatId, text, replyToMessageId) {
   }
 }
 
-// --- STEP 1: RECEIVE FILE & ASK FOR LANGUAGE ---
+// Parse HH:MM:SS to seconds
+function parseTimecode(str) {
+  const parts = str.trim().split(':').map(Number);
+  if (parts.length !== 3 || parts.some(isNaN)) return null;
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+// Convert seconds to HH:MM:SS
+function formatDuration(sec) {
+  return new Date(sec * 1000).toISOString().substr(11, 8);
+}
+
+// --- MESSAGE HANDLER (For Timecode Input) ---
+bot.on('message', async (msg) => {
+  if (!isUserAllowed(msg)) return;
+  const chatId = msg.chat.id;
+
+  // Check if we are waiting for timecodes from this user
+  if (!waitingForTimecodes.has(chatId)) return;
+
+  const state = waitingForTimecodes.get(chatId);
+  const text = msg.text || '';
+
+  // 1. Parse Input
+  const timecodes = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (timecodes.length === 0) {
+    return bot.sendMessage(chatId, '⚠️ Please send at least one timecode (HH:MM:SS).');
+  }
+
+  // 2. Validate Format & Logic
+  const splitPoints = [];
+  let previousTime = 0;
+
+  for (const tc of timecodes) {
+    const seconds = parseTimecode(tc);
+    if (seconds === null) {
+      return bot.sendMessage(chatId, `❌ Invalid format: "${tc}". Please use HH:MM:SS (e.g., 00:15:30).`);
+    }
+    if (seconds <= previousTime) {
+      return bot.sendMessage(chatId, `❌ Invalid order: "${tc}" must be later than previous split.`);
+    }
+    if (seconds >= state.duration) {
+      return bot.sendMessage(chatId, `❌ Timecode "${tc}" is beyond file duration (${formatDuration(state.duration)}).`);
+    }
+
+    // Check segment length
+    if (seconds - previousTime > MAX_SEGMENT_DURATION_SEC) {
+      return bot.sendMessage(chatId, `❌ Segment too long! Gap before "${tc}" is > 19 mins. Please add an intermediate split.`);
+    }
+
+    splitPoints.push(tc); // Keep string format for ffmpeg
+    previousTime = seconds;
+  }
+
+  // Check final segment (last split -> end of file)
+  if (state.duration - previousTime > MAX_SEGMENT_DURATION_SEC) {
+    return bot.sendMessage(chatId, `❌ Final segment too long! Gap from "${timecodes[timecodes.length - 1]}" to end is > 19 mins.`);
+  }
+
+  // 3. SUCCESS - Proceed to Processing
+  waitingForTimecodes.delete(chatId);
+  bot.sendMessage(chatId, '✅ Timecodes accepted. Splitting and processing...');
+
+  await executeTranscription(chatId, state.filePath, state.lang, state.originalMessageId, state.localFilePath, splitPoints);
+});
+
+// --- STEP 1: INITIAL SETUP ---
 async function handleMediaMessage(msg, type) {
   if (!isUserAllowed(msg)) return;
-
   const chatId = msg.chat.id;
-  const messageId = msg.message_id;
+
+  // Clean up any existing wait states for this chat
+  waitingForTimecodes.delete(chatId);
 
   let fileId;
   if (type === 'voice') fileId = msg.voice.file_id;
@@ -123,8 +190,9 @@ async function handleMediaMessage(msg, type) {
 
   if (!fileId) return bot.sendMessage(chatId, '❌ Error: No file ID found.');
 
-  const opts = {
-    reply_to_message_id: messageId,
+  const promptMsg = await bot.sendMessage(chatId, `Detected **${type}**. Choose language:`, {
+    reply_to_message_id: msg.message_id,
+    parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
         [
@@ -138,111 +206,125 @@ async function handleMediaMessage(msg, type) {
         [{ text: '❌ Cancel', callback_data: 'cancel' }],
       ],
     },
-  };
+  });
 
-  // Send the prompt and capture the sent message (so we can delete/edit it later)
-  const promptMsg = await bot.sendMessage(chatId, `Detected **${type}**. Choose language to transcribe:`, { parse_mode: 'Markdown', ...opts });
-
-  // Store Request in Memory with Timestamp
   pendingRequests.set(chatId, {
     fileId,
     type,
-    originalMessageId: messageId,
-    promptMessageId: promptMsg.message_id, // <--- Saved for expiration editing
-    timestamp: Date.now(), // <--- Saved for timeout check
+    originalMessageId: msg.message_id,
+    promptMessageId: promptMsg.message_id,
+    timestamp: Date.now(),
   });
 }
 
-// --- STEP 2: HANDLE BUTTON CLICK & PROCESS ---
-bot.on('callback_query', async (callbackQuery) => {
-  if (!ALLOWED_TELEGRAM_USERS.includes(callbackQuery.from.id)) return;
+// --- STEP 2: BUTTON CLICK ---
+bot.on('callback_query', async (query) => {
+  if (!ALLOWED_TELEGRAM_USERS.includes(query.from.id)) return;
+  const chatId = query.message.chat.id;
+  const { data } = query;
 
-  const chatId = callbackQuery.message.chat.id;
-  const { data } = callbackQuery;
-  const messageIdOfPrompt = callbackQuery.message.message_id;
+  bot.answerCallbackQuery(query.id).catch(() => {});
 
-  // 1. ANSWER IMMEDIATELY (Fixes "query is too old" error)
-  // We answer right away so the button stops "loading" on the user's screen.
-  // We use .catch() to ignore errors if the user clicked too late.
-  bot.answerCallbackQuery(callbackQuery.id).catch((err) => {});
-
-  // Handle Cancel
   if (data === 'cancel') {
     pendingRequests.delete(chatId);
-    bot.deleteMessage(chatId, messageIdOfPrompt).catch(() => {});
+    bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
     return;
   }
 
-  // Retrieve Request
   const request = pendingRequests.get(chatId);
+  if (!request) return bot.editMessageText('⚠️ Expired.', { chat_id: chatId, message_id: query.message.message_id }).catch(() => {});
 
-  if (!request) {
-    return bot
-      .editMessageText('⚠️ Request expired or not found. Please resend.', {
-        chat_id: chatId,
-        message_id: messageIdOfPrompt,
-      })
-      .catch(() => {});
-  }
-
-  // Determine Language
-  const langCode = data.replace('lang_', '');
-
-  // Cleanup UI
-  bot.deleteMessage(chatId, messageIdOfPrompt).catch(() => {});
+  bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
   pendingRequests.delete(chatId);
 
-  // --- START PROCESSING ---
-  // Now we can take as long as we want because we already answered the button.
-  await processMediaRequest(chatId, request, langCode);
+  const langCode = data.replace('lang_', '');
+  await prepareFileForProcessing(chatId, request, langCode);
 });
 
-// --- CORE PROCESSING LOGIC ---
-async function processMediaRequest(chatId, request, language) {
-  const { fileId, type, originalMessageId } = request;
+// --- STEP 3: PREPARE & CHECK DURATION ---
+async function prepareFileForProcessing(chatId, request, lang) {
   let convertedAudioPath = null;
   let localFilePath = null;
   let processingMsg = null;
 
   try {
-    processingMsg = await bot.sendMessage(chatId, `⬇️ Processing ${type} (${language})...`, {
-      reply_to_message_id: originalMessageId,
-    });
+    processingMsg = await bot.sendMessage(chatId, `⬇️ Downloading & Checking duration...`, { reply_to_message_id: request.originalMessageId });
 
-    const fileInfo = await bot.getFile(fileId);
+    const fileInfo = await bot.getFile(request.fileId);
     localFilePath = fileInfo.file_path;
 
-    if (!localFilePath) throw new Error('Local server did not return a file path.');
-    console.log(`Processing: ${localFilePath}`);
+    if (!localFilePath) throw new Error('Local server error.');
 
-    convertedAudioPath = path.join(VOICE_MESSAGES_DIR, `${type}_${chatId}_${Date.now()}_audio.mp3`);
+    // Convert to MP3
+    convertedAudioPath = path.join(VOICE_MESSAGES_DIR, `${request.type}_${chatId}_${Date.now()}_audio.mp3`);
     await extractAudio(localFilePath, convertedAudioPath);
 
-    const { formattedTranscript } = await processFile(convertedAudioPath, language);
-    const finalText = formattedTranscript || '⚠️ Transcription returned empty.';
+    // Check Duration
+    const duration = await getDuration(convertedAudioPath);
+    console.log(`Duration: ${duration}s`);
 
-    await sendLongMessage(chatId, finalText, originalMessageId);
+    // Logic Branch
+    if (duration > MAX_SEGMENT_DURATION_SEC) {
+      // > 19 Mins: ASK USER
+      waitingForTimecodes.set(chatId, {
+        filePath: convertedAudioPath,
+        localFilePath, // Keep reference to clean up later
+        lang,
+        originalMessageId: request.originalMessageId,
+        duration,
+        timestamp: Date.now(),
+      });
 
-    bot.deleteMessage(chatId, processingMsg.message_id).catch(() => {});
+      const totalTimeStr = formatDuration(duration);
+      const msgText =
+        `⚠️ **File is too long (${totalTimeStr})**\n` +
+        `Service allows max 19 min segments.\n\n` +
+        `Please **reply to this message** with a list of timecodes (HH:MM:SS) where I should split the video.\n` +
+        `Example for a 45 min video:\n` +
+        `\`00:15:00\`\n` +
+        `\`00:30:00\`\n\n` +
+        `_Each segment must be < 19 minutes._`;
+
+      await bot.editMessageText(msgText, {
+        chat_id: chatId,
+        message_id: processingMsg.message_id,
+        parse_mode: 'Markdown',
+      });
+    } else {
+      // < 19 Mins: PROCESS IMMEDIATELY
+      await bot.deleteMessage(chatId, processingMsg.message_id).catch(() => {});
+      await executeTranscription(chatId, convertedAudioPath, lang, request.originalMessageId, localFilePath, null);
+    }
   } catch (error) {
-    console.error(`Error processing ${type}:`, error);
-    bot.sendMessage(chatId, '❌ Failed to process media.', { reply_to_message_id: originalMessageId });
-  } finally {
-    cleanupFiles(convertedAudioPath);
-    cleanupFiles(localFilePath);
+    console.error(error);
+    bot.sendMessage(chatId, '❌ Error preparing file.', { reply_to_message_id: request.originalMessageId });
+    cleanupFiles(convertedAudioPath, localFilePath);
   }
 }
 
-// --- COMMANDS ---
-bot.onText(/\/start/, (msg) => {
-  if (isUserAllowed(msg)) {
-    bot.sendMessage(msg.chat.id, 'Welcome! Send me a Voice, Video, or Video Note, and I will ask you for the language.');
+// --- STEP 4: EXECUTE TRANSCRIPTION ---
+async function executeTranscription(chatId, audioPath, lang, replyMsgId, originalSourcePath, splitPoints) {
+  let procMsg = null;
+  try {
+    procMsg = await bot.sendMessage(chatId, `🎙️ Transcribing (${lang})...`, { reply_to_message_id: replyMsgId });
+
+    // Pass splitPoints (if any) to transcribe.js
+    const { formattedTranscript } = await processFile(audioPath, lang, splitPoints);
+    const finalText = formattedTranscript || '⚠️ Empty result.';
+
+    await sendLongMessage(chatId, finalText, replyMsgId);
+    bot.deleteMessage(chatId, procMsg.message_id).catch(() => {});
+  } catch (err) {
+    console.error('Transcription failed:', err);
+    bot.sendMessage(chatId, '❌ Transcription failed.');
+  } finally {
+    cleanupFiles(audioPath, originalSourcePath);
   }
-});
+}
 
 // --- LISTENERS ---
 bot.on('voice', (msg) => handleMediaMessage(msg, 'voice'));
 bot.on('video_note', (msg) => handleMediaMessage(msg, 'video_note'));
 bot.on('video', (msg) => handleMediaMessage(msg, 'video'));
 
-console.log('Bot is running with 15m timeout...');
+console.log('Bot is running (Manual Split Mode)...');
