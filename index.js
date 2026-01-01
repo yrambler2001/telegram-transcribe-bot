@@ -161,6 +161,11 @@ bot.on('callback_query', async (callbackQuery) => {
   const { data } = callbackQuery;
   const messageIdOfPrompt = callbackQuery.message.message_id;
 
+  // 1. ANSWER IMMEDIATELY (Fixes "query is too old" error)
+  // We answer right away so the button stops "loading" on the user's screen.
+  // We use .catch() to ignore errors if the user clicked too late.
+  bot.answerCallbackQuery(callbackQuery.id).catch((err) => {});
+
   // Handle Cancel
   if (data === 'cancel') {
     pendingRequests.delete(chatId);
@@ -172,7 +177,6 @@ bot.on('callback_query', async (callbackQuery) => {
   const request = pendingRequests.get(chatId);
 
   if (!request) {
-    // If request is missing (expired or already processed)
     return bot
       .editMessageText('⚠️ Request expired or not found. Please resend.', {
         chat_id: chatId,
@@ -184,14 +188,13 @@ bot.on('callback_query', async (callbackQuery) => {
   // Determine Language
   const langCode = data.replace('lang_', '');
 
-  // Cleanup UI immediately
+  // Cleanup UI
   bot.deleteMessage(chatId, messageIdOfPrompt).catch(() => {});
   pendingRequests.delete(chatId);
 
   // --- START PROCESSING ---
+  // Now we can take as long as we want because we already answered the button.
   await processMediaRequest(chatId, request, langCode);
-
-  bot.answerCallbackQuery(callbackQuery.id);
 });
 
 // --- CORE PROCESSING LOGIC ---
