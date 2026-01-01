@@ -29,6 +29,11 @@ function formatTime(secondsString, offsetSeconds = 0) {
   return `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
 }
 
+// Convert "1.200s" string to float 1.2
+function parseSeconds(timeString) {
+  return timeString ? parseFloat(timeString.replace('s', '')) : 0;
+}
+
 function getDuration(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -46,14 +51,7 @@ function splitAudio(filePath, segmentTime = 1140) {
     console.log(`✂️ Splitting large file (Re-encoding): ${filePath}...`);
 
     ffmpeg(filePath)
-      .outputOptions([
-        `-f segment`,
-        `-segment_time ${segmentTime}`,
-        // CHANGED: Use re-encoding instead of copy to fix timestamp/header issues
-        `-c:a libmp3lame`,
-        `-b:a 320k`,
-        `-reset_timestamps 1`,
-      ])
+      .outputOptions([`-f segment`, `-segment_time ${segmentTime}`, `-c:a libmp3lame`, `-b:a 320k`, `-reset_timestamps 1`])
       .output(outputPattern)
       .on('end', () => {
         fs.readdir(dir, (err, files) => {
@@ -61,7 +59,7 @@ function splitAudio(filePath, segmentTime = 1140) {
           const parts = files
             .filter((f) => f.startsWith(`${name}_part_`) && f.endsWith(ext))
             .map((f) => path.join(dir, f))
-            .sort(); // Ensure order: part_000, part_001...
+            .sort();
           resolve(parts);
         });
       })
@@ -141,30 +139,58 @@ async function transcribePart(filename, lang, timeOffset = 0) {
       storageClient.bucket(BUCKET_NAME).file(outputFileName).delete(),
     ]);
 
+    // --- SMART PARSING WITH SILENCE HEURISTIC ---
     const allWords = jsonResponse.results.flatMap((r) => r.alternatives[0].words || []);
     let formattedTranscript = '';
     let currentLine = '';
     let currentLineStartTime = null;
+    let lastWordEndTime = 0; // Track when the previous word ended
 
     allWords.forEach((wordObj, index) => {
       const { word } = wordObj;
       const start = wordObj.startOffset || '0s';
+      const end = wordObj.endOffset || '0s';
+
+      const startSeconds = parseSeconds(start);
+      const endSeconds = parseSeconds(end);
+
+      // Check gap from previous word
+      const gap = startSeconds - lastWordEndTime;
+
+      // Heuristic: If gap is big, assume a pause/sentence break
+      // 1.0s = New Line
+      // 0.6s = Comma (visual only, we won't insert ',' but we might break line if line is long)
+      const isSignificantPause = index > 0 && gap > 1.0;
 
       if (currentLine === '') currentLineStartTime = start;
-      currentLine += `${word} `;
 
+      // If significant pause detected and we have content, flush the line
+      if (isSignificantPause && currentLine.length > 0) {
+        formattedTranscript += `${formatTime(currentLineStartTime, timeOffset)} ${currentLine.trim()}\n`;
+        currentLine = '';
+        currentLineStartTime = start;
+      }
+
+      currentLine += `${word} `;
+      lastWordEndTime = endSeconds;
+
+      // Standard Punctuation Checks (Google Provided)
       const isSentenceEnd = /[.!?]$/.test(word);
       const isComma = /[,]$/.test(word);
       const isLong = currentLine.length > 100;
 
-      if (isSentenceEnd || (isLong && isComma) || index === allWords.length - 1) {
+      // Flush if:
+      // 1. Google gave us a period/question mark
+      // 2. Line is long AND Google gave us a comma
+      // 3. Line is very long (>150 chars) to prevent walls of text
+      // 4. It's the last word
+      if (isSentenceEnd || (isLong && isComma) || currentLine.length > 150 || index === allWords.length - 1) {
         formattedTranscript += `${formatTime(currentLineStartTime, timeOffset)} ${currentLine.trim()}\n`;
         currentLine = '';
         currentLineStartTime = null;
       }
     });
 
-    // ADDED LOG: See if the part returned empty text
     console.log(`✅ Part finished: ${base} (Length: ${formattedTranscript.length} chars)`);
 
     return formattedTranscript;
@@ -197,7 +223,6 @@ export async function processFile(filename, lang = 'uk') {
   let isSplit = false;
 
   if (duration > SPLIT_THRESHOLD) {
-    // This will now use the updated safe splitting (re-encoding)
     filesToProcess = await splitAudio(filename, SPLIT_THRESHOLD);
     isSplit = true;
   } else {
@@ -213,10 +238,8 @@ export async function processFile(filename, lang = 'uk') {
 
     const batchPromises = batch.map(async (file, index) => {
       await sleep(index * 2000);
-
       const globalIndex = i + index;
       const timeOffset = globalIndex * SPLIT_THRESHOLD;
-
       return transcribePart(file, lang, timeOffset);
     });
 
