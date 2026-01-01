@@ -33,7 +33,7 @@ function getDuration(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
       if (err) return reject(err);
-      resolve(metadata.format.duration); // Returns duration in seconds
+      resolve(metadata.format.duration);
     });
   });
 }
@@ -43,18 +43,19 @@ function splitAudio(filePath, segmentTime = 1140) {
     const { dir, name, ext } = path.parse(filePath);
     const outputPattern = path.join(dir, `${name}_part_%03d${ext}`);
 
-    console.log(`✂️ Splitting large file: ${filePath}...`);
+    console.log(`✂️ Splitting large file (Re-encoding): ${filePath}...`);
 
     ffmpeg(filePath)
       .outputOptions([
         `-f segment`,
         `-segment_time ${segmentTime}`,
-        `-c copy`, // Fast splitting without re-encoding
+        // CHANGED: Use re-encoding instead of copy to fix timestamp/header issues
+        `-c:a libmp3lame`,
+        `-b:a 320k`,
         `-reset_timestamps 1`,
       ])
       .output(outputPattern)
       .on('end', () => {
-        // Find all generated parts
         fs.readdir(dir, (err, files) => {
           if (err) return reject(err);
           const parts = files
@@ -69,12 +70,11 @@ function splitAudio(filePath, segmentTime = 1140) {
   });
 }
 
-// --- CORE GCS TRANSCRIPTION LOGIC (Single Part) ---
+// --- CORE GCS TRANSCRIPTION LOGIC ---
 async function transcribePart(filename, lang, timeOffset = 0) {
   const projectId = await speechClient.getProjectId();
   const { name, base } = path.parse(filename);
 
-  // Unique GCS paths to avoid collisions between parts
   const gcsAudioUri = `gs://${BUCKET_NAME}/${GCS_AUDIO_FILES_PREFIX}${base}`;
   const gcsOutputUri = `gs://${BUCKET_NAME}/${GCS_TRANSCRIPTS_PREFIX}${name}_${Date.now()}.json`;
 
@@ -97,11 +97,10 @@ async function transcribePart(filename, lang, timeOffset = 0) {
       },
       files: [{ uri: gcsAudioUri }],
       recognitionOutputConfig: {
-        gcsOutputConfig: { uri: gcsOutputUri }, // Direct output file URI
+        gcsOutputConfig: { uri: gcsOutputUri },
       },
     };
 
-    // Retry Logic
     let operation;
     let retries = 0;
     const MAX_RETRIES = 5;
@@ -126,13 +125,10 @@ async function transcribePart(filename, lang, timeOffset = 0) {
     console.log(`🤖 Processing part: ${base}`);
     const [response] = await operation.promise();
 
-    // The result key in response matches the input URI
     const fileResult = response.results[gcsAudioUri];
     if (!fileResult) throw new Error('Google returned no result for part.');
     if (fileResult.error) throw new Error(`Google Error: ${fileResult.error.message}`);
 
-    // Retrieve JSON from GCS
-    // Chirp 2/3 sometimes returns .cloudStorageResult.jsonResult.uri or .uri
     const resultUri = fileResult.cloudStorageResult?.jsonResult?.uri || fileResult.cloudStorageResult?.uri;
     if (!resultUri) throw new Error('Output URI missing in response.');
 
@@ -140,13 +136,11 @@ async function transcribePart(filename, lang, timeOffset = 0) {
     const [tempFile] = await storageClient.bucket(BUCKET_NAME).file(outputFileName).download();
     const jsonResponse = JSON.parse(tempFile.toString());
 
-    // Clean up GCS immediately
     await Promise.allSettled([
       storageClient.bucket(BUCKET_NAME).file(`${GCS_AUDIO_FILES_PREFIX}${base}`).delete(),
       storageClient.bucket(BUCKET_NAME).file(outputFileName).delete(),
     ]);
 
-    // Parse Transcript
     const allWords = jsonResponse.results.flatMap((r) => r.alternatives[0].words || []);
     let formattedTranscript = '';
     let currentLine = '';
@@ -164,12 +158,14 @@ async function transcribePart(filename, lang, timeOffset = 0) {
       const isLong = currentLine.length > 100;
 
       if (isSentenceEnd || (isLong && isComma) || index === allWords.length - 1) {
-        // Apply the global time offset for this part
         formattedTranscript += `${formatTime(currentLineStartTime, timeOffset)} ${currentLine.trim()}\n`;
         currentLine = '';
         currentLineStartTime = null;
       }
     });
+
+    // ADDED LOG: See if the part returned empty text
+    console.log(`✅ Part finished: ${base} (Length: ${formattedTranscript.length} chars)`);
 
     return formattedTranscript;
   } catch (err) {
@@ -189,28 +185,25 @@ const langMap = {
 export async function processFile(filename, lang = 'uk') {
   console.log(`🚀 Starting job for: ${filename} [${lang}]`);
 
-  // 1. Duration Check
   const duration = await getDuration(filename);
   console.log(`⏱️ Duration: ${Math.round(duration)}s`);
 
   if (duration > 10800) {
-    // 3 Hours (3 * 60 * 60)
     throw new Error(`File is too long (${Math.round(duration / 60)}m). Limit is 3 hours.`);
   }
 
-  // 2. Prepare Chunks
-  const SPLIT_THRESHOLD = 1140; // 19 Minutes in seconds
+  const SPLIT_THRESHOLD = 1140;
   let filesToProcess = [];
   let isSplit = false;
 
   if (duration > SPLIT_THRESHOLD) {
+    // This will now use the updated safe splitting (re-encoding)
     filesToProcess = await splitAudio(filename, SPLIT_THRESHOLD);
     isSplit = true;
   } else {
     filesToProcess = [filename];
   }
 
-  // 3. Process in Batches
   const BATCH_SIZE = 4;
   let fullTranscript = '';
 
@@ -218,32 +211,24 @@ export async function processFile(filename, lang = 'uk') {
     const batch = filesToProcess.slice(i, i + BATCH_SIZE);
     console.log(`📦 Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(filesToProcess.length / BATCH_SIZE)} (${batch.length} files)...`);
 
-    // Create promises for the batch
     const batchPromises = batch.map(async (file, index) => {
-      // Stagger start times: 0ms, 2000ms, 4000ms, 6000ms...
       await sleep(index * 2000);
 
-      // Calculate correct timestamp offset
-      // e.g. Part 0 = 0s offset, Part 1 = 1140s offset
       const globalIndex = i + index;
       const timeOffset = globalIndex * SPLIT_THRESHOLD;
 
       return transcribePart(file, lang, timeOffset);
     });
 
-    // Wait for entire batch to finish
     const batchResults = await Promise.all(batchPromises);
     fullTranscript += batchResults.join('\n');
   }
 
-  // 4. Cleanup Split Files (if we created them)
   if (isSplit) {
     filesToProcess.forEach((f) => {
       try {
         fs.unlinkSync(f);
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) {}
     });
     console.log('🧹 Cleaned up split parts.');
   }
